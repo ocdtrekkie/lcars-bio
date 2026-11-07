@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>
+    {{ doc.character.name or 'Character biography' }} | Personnel Archive
+  </title>
+  <link rel="stylesheet" href="lcars.css">
+</head>
+<body>
+  <div class="console">
+    <aside>
+      <div class="elbow">LCARS<br>PERSONNEL</div>
+      <nav aria-label="Sections">
+        <a href="#identity">01 · Identity</a>
+        <a href="#biography">02 · Biography</a>
+        <a href="#gallery">03 · Images</a>
+        <a href="character.json">04 · Character JSON</a>
+      </nav>
+      <div class="sidebar-tail">SIMMING<br>PUBLIC ARCHIVE</div>
+    </aside>
+
+    <main>
+      <header>
+        <div class="bar"></div>
+        <p>STARFLEET PERSONNEL ARCHIVE</p>
+        <h1>{{ doc.character.name or 'Unassigned personnel' }}</h1>
+        <p>
+          {{ doc.character.rank or 'Rank not set' }}
+          /
+          {{ doc.character.assignment or 'Assignment pending' }}
+        </p>
+        <span class="status">
+          PUBLIC RECORD · REVISION {{ doc.revision }}
+        </span>
+      </header>
+
+      {% for group, entries in fields.items() %}
+        <section id="{{ group|lower }}">
+          <h2>{{ group }}</h2>
+          <dl class="public-fields">
+            {% for key, label in entries %}
+              {% set value = doc.character.get(key, '') %}
+              {% if value %}
+                <dt>{{ label }}</dt>
+                <dd>{{ value }}</dd>
+              {% endif %}
+            {% endfor %}
+          </dl>
+        </section>
+      {% endfor %}
+
+      <section id="gallery">
+        <h2>Character images</h2>
+        <div class="gallery">
+          {% for image in doc.images %}
+            <figure>
+              <a href="images/{{ image.filename }}">
+                <img
+                  src="images/{{ image.filename }}"
+                  alt="{{ image.caption or 'Character portrait' }}"
+                  loading="lazy"
+                >
+              </a>
+              <figcaption>
+                {{ image.caption or 'Character portrait' }}
+              </figcaption>
+            </figure>
+          {% else %}
+            <p>No visual records on file.</p>
+          {% endfor %}
+        </div>
+      </section>
+
+      <footer>
+        END OF RECORD · PERSONAL SIMMING ARCHIVE · Unofficial fan project
+      </footer>
+    </main>
+  </div>
+</body>
+</html>

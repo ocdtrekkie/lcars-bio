@@ -9,15 +9,32 @@ from pathlib import Path
 import fcntl
 from flask import Flask, abort, flash, redirect, render_template, request, send_file, send_from_directory, session, url_for
 from PIL import Image, ImageOps, UnidentifiedImageError
+import subprocess
+from urllib.parse import urlsplit
 
 FIELDS = {
-    "Identity": [("name", "Full name"), ("rank", "Rank"), ("position", "Position / department"),
-                 ("assignment", "Ship / station / simm"), ("species", "Species"), ("pronouns", "Pronouns"),
-                 ("age", "Age"), ("birthplace", "Birthplace"), ("height", "Height (include units)"),
-                 ("weight", "Weight (include units)")],
-    "Biography": [("physical_description", "Physical description"), ("family", "Family members"),
-                  ("personality", "Personality"), ("history", "Personal history"),
-                  ("service_record", "Service record"), ("notes", "Simming notes")]
+    "Identity": [
+        ("name", "Full name"),
+        ("rank", "Rank"),
+        ("position", "Position / department"),
+        ("assignment", "Ship / station / simm"),
+        ("species", "Species"),
+        ("pronouns", "Pronouns"),
+        ("age", "Age"),
+        ("birthplace", "Birthplace"),
+        ("height", "Height (include units)"),
+        ("weight", "Weight (include units)"),
+        ("hair_color", "Hair color"),
+        ("eye_color", "Eye color"),
+    ],
+    "Biography": [
+        ("physical_description", "Physical description"),
+        ("family", "Family members"),
+        ("personality", "Personality"),
+        ("history", "Personal history"),
+        ("service_record", "Service record"),
+        ("notes", "Simming notes"),
+    ],
 }
 KEYS = [key for group in FIELDS.values() for key, _ in group]
 DATA = Path(os.environ.get("BIO_DATA_DIR", "./data")).resolve()
@@ -25,6 +42,19 @@ DATA.mkdir(parents=True, exist_ok=True)
 UPLOADS = DATA / "images"
 UPLOADS.mkdir(exist_ok=True)
 SECRET = DATA / "session-secret"
+APP_DIR = Path(__file__).resolve().parent
+
+PUBLIC_DIR = Path(
+    os.environ.get("BIO_PUBLIC_DIR", "/var/www")
+)
+PUBLIC_URL_FILE = DATA / "public-url"
+
+GET_PUBLIC_ID = Path(
+    os.environ.get(
+        "GET_PUBLIC_ID",
+        str(APP_DIR / "sandstorm-integration" / "getPublicId"),
+    )
+)
 try:
     fd = os.open(SECRET, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
 except FileExistsError:
@@ -51,8 +81,11 @@ def load():
     return json.loads(path.read_text(encoding='utf-8'))
 
 def atomic_write(path, content):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
     fd, temporary = tempfile.mkstemp(
-        dir=DATA,
+        dir=path.parent,
         prefix=f".{path.name}-",
     )
     try:
@@ -65,7 +98,6 @@ def atomic_write(path, content):
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
-
 
 def save(doc):
     current = DATA / "character.json"
@@ -98,6 +130,64 @@ def save(doc):
     atomic_write(current, payload)
     doc["revision"] = updated["revision"]
 
+def public_url():
+    if not PUBLIC_URL_FILE.exists():
+        return None
+
+    return PUBLIC_URL_FILE.read_text(encoding="utf-8").strip() or None
+
+
+def publish_snapshot(doc):
+    """Caller must hold locked(). Publish only explicitly allowed files."""
+    PUBLIC_DIR.mkdir(parents=True, exist_ok=True)
+    public_images = PUBLIC_DIR / "images"
+    public_images.mkdir(exist_ok=True)
+
+    # Prepare everything before changing the published snapshot.
+    image_payloads = {}
+
+    for image in doc["images"]:
+        filename = image["filename"]
+
+        # Never allow JSON filenames to escape the image directory.
+        if (
+            not filename
+            or Path(filename).name != filename
+            or "/" in filename
+            or "\\" in filename
+            or not filename.endswith(".jpg")
+        ):
+            raise ValueError("Invalid image filename in character record.")
+
+        image_payloads[filename] = (UPLOADS / filename).read_bytes()
+
+    stylesheet = (APP_DIR / "static" / "lcars.css").read_bytes()
+
+    json_payload = json.dumps(
+        doc,
+        ensure_ascii=False,
+        indent=2,
+    ).encode("utf-8")
+
+    html_payload = render_template(
+        "public.html",
+        doc=doc,
+        fields=FIELDS,
+    ).encode("utf-8")
+
+    # Publish assets first, then the documents referring to them.
+    for filename, content in image_payloads.items():
+        atomic_write(public_images / filename, content)
+
+    atomic_write(PUBLIC_DIR / "lcars.css", stylesheet)
+    atomic_write(PUBLIC_DIR / "character.json", json_payload)
+    atomic_write(PUBLIC_DIR / "index.html", html_payload)
+
+    # Remove previously published images no longer in the current record.
+    for path in public_images.iterdir():
+        if path.is_file() and path.name not in image_payloads:
+            path.unlink()
+
 def editable():
     return not SANDSTORM or 'edit' in {p.strip() for p in request.headers.get('X-Sandstorm-Permissions', '').split(',')}
 
@@ -118,17 +208,51 @@ def protect():
 
 @app.after_request
 def headers(response):
-    response.headers['X-Content-Type-Options'] = 'nosniff'
-    response.headers['Referrer-Policy'] = 'no-referrer'
-    response.headers['Content-Security-Policy'] = "default-src 'self'; img-src 'self'; style-src 'self'; script-src 'none'; object-src 'none'; base-uri 'none'; form-action 'self'"
-    response.headers['Cache-Control'] = 'no-store'
+    if request.method == "POST" and response.status_code < 400:
+        try:
+            with locked():
+                if public_url():
+                    publish_snapshot(load())
+        except Exception:
+            app.logger.exception(
+                "The change was saved, but static publishing failed"
+            )
+            response = app.make_response((
+                render_template(
+                    "error.html",
+                    message=(
+                        "Your change was saved, but the public biography "
+                        "could not be refreshed. The public page may still "
+                        "show an older version. Return to the record and "
+                        "save again to retry."
+                    ),
+                ),
+                503,
+            ))
+
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; img-src 'self'; style-src 'self'; "
+        "script-src 'none'; object-src 'none'; base-uri 'none'; "
+        "form-action 'self'"
+    )
+    response.headers["Cache-Control"] = "no-store"
     return response
 
-@app.get('/')
+@app.get("/")
 def index():
     with locked():
         doc = load()
-    return render_template('index.html', doc=doc, fields=FIELDS, can_edit=editable())
+        published_url = public_url()
+
+    return render_template(
+        "index.html",
+        doc=doc,
+        fields=FIELDS,
+        can_edit=editable(),
+        published_url=published_url,
+    )
 
 @app.post('/save')
 def update():
@@ -206,6 +330,54 @@ def export():
     with locked():
         payload = json.dumps(load(), ensure_ascii=False, indent=2).encode('utf-8')
     return send_file(io.BytesIO(payload), mimetype='application/json', as_attachment=True, download_name='character.json')
+
+@app.post("/publish")
+def enable_publishing():
+    if not SANDSTORM:
+        abort(400, "Static publishing must be enabled from a Sandstorm grain.")
+
+    session_id = request.headers.get("X-Sandstorm-Session-Id")
+    if not session_id:
+        abort(400, "Sandstorm did not provide a session ID.")
+
+    try:
+        result = subprocess.run(
+            [str(GET_PUBLIC_ID), session_id],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (
+        OSError,
+        subprocess.SubprocessError,
+        UnicodeError,
+    ):
+        app.logger.exception("Could not obtain the public URL")
+        abort(503, "Could not enable publishing. Please try again.")
+
+    lines = result.stdout.splitlines()
+    if len(lines) < 3:
+        abort(503, "The publishing helper returned an unexpected response.")
+
+    url = lines[2].strip()
+    parsed = urlsplit(url)
+
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        abort(503, "The publishing helper returned an invalid public URL.")
+
+    # Persist the URL only after the first snapshot has been generated.
+    with locked():
+        publish_snapshot(load())
+        atomic_write(PUBLIC_URL_FILE, url.encode("utf-8"))
+
+    flash("Publishing enabled. Future changes will update the public biography.")
+    return redirect(url_for("index"))
 
 @app.errorhandler(413)
 def too_large(error):
